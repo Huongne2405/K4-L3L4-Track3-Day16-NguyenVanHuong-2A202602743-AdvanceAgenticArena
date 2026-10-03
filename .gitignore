@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# Local API credentials
+.env
+.env.*
+!.env.example
+
 # Test + tooling caches
 .pytest_cache/
 .mypy_cache/

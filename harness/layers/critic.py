@@ -71,6 +71,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.research import research_messages, research_tool_call, reviewed_model_call
 
 
 class Critic(Middleware):
@@ -78,17 +79,68 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def before_model(self, ctx, messages):
+        return research_messages(ctx, messages)
+
+    def wrap_model_call(self, ctx, call, messages):
+        return reviewed_model_call(ctx, call, messages)
+
+    def wrap_tool_call(self, ctx, call, name, args):
+        return research_tool_call(ctx, call, name, args)
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        observed = ctx.observed_text
+        observed_lines = observed.splitlines()
+        sources = [
+            doc for doc in ctx.corpus.docs if doc.body in observed
+        ] if ctx.corpus is not None else []
+        kept = []
+        conflict = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if any(text in line for line in observed_lines):
+                kept.append(claim)
+                continue
+            # Only trim model-written text; never complete it from the corpus.
+            offset = text.find(" và ")
+            while offset != -1:
+                left, right = text[:offset].strip(), text[offset + 4:].strip()
+                left_sources = [d for d in sources if left and any(
+                    left in line for line in d.body.splitlines()
+                )]
+                right_sources = [d for d in sources if right and any(
+                    right in line for line in d.body.splitlines()
+                )]
+                pair = next(((a, b) for a in left_sources for b in right_sources
+                             if a.doc_id != b.doc_id), None)
+                if pair is not None:
+                    kept.extend([
+                        {"text": left, "doc_id": pair[0].doc_id},
+                        {"text": right, "doc_id": pair[1].doc_id},
+                    ])
+                    conflict = True
+                    break
+                # Adjacent conjunctions can share their separating space.
+                offset = text.find(" và ", offset + 1)
+        report["claims"] = kept
+        report["citations"] = sorted({
+            c["doc_id"] for c in kept
+            if isinstance(c.get("doc_id"), str) and c["doc_id"]
+        })
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ từ tài liệu đã đọc để trả lời câu hỏi."
+        elif conflict:
+            report["abstain"] = True
+            report["answer"] = "Các nguồn mâu thuẫn; chưa thể kết luận. " + " ".join(
+                c["text"] for c in kept
+            )
+        elif kept != claims:
+            report["answer"] = " ".join(c["text"] for c in kept)
+        return report
